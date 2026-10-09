@@ -1,0 +1,19 @@
+name: Build Serverpod
+description: Compile a Serverpod server on the runner and assemble the SiteHost release tree.
+author: Talaria
+branding:
+  icon: package
+  color: blue
+inputs:
+  server_path:
+    description: Serverpod server package, relative to the caller repository.
+    required: true
+    default: server
+runs:
+  using: composite
+  steps:
+    - name: Build
+      shell: bash
+      env:
+        SERVER_PATH: ${{ inputs.server_path }}
+      run: bash "$GITHUB_ACTION_PATH/build-server.sh"

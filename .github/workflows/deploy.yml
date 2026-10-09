@@ -1,0 +1,344 @@
+# Build a Serverpod server and publish it to a SiteHost container.
+#
+# Called by the app repository. See README.md for secrets, variables, and the caller.
+
+name: Deploy Serverpod to SiteHost
+
+on:
+  workflow_call:
+    inputs:
+      environment:
+        description: GitHub environment name for this container.
+        type: string
+        required: true
+      emergency_override:
+        description: Deploy a ref that is not main or a tag when require_main_or_tag is set.
+        type: boolean
+        required: false
+        default: false
+      require_main_or_tag:
+        description: Fail unless this run is from main or a tag.
+        type: boolean
+        required: false
+        default: false
+      server_path:
+        description: Serverpod server package, relative to the repository root.
+        type: string
+        required: false
+        default: server
+      dart_version:
+        description: Dart SDK version to install on the runner.
+        type: string
+        required: false
+        default: "3.12.2"
+      apply_migrations:
+        description: Pass --apply-migrations when the process starts.
+        type: boolean
+        required: false
+        default: true
+      web_path:
+        description: Optional location proxied to the Serverpod web server on port 8082.
+        type: string
+        required: false
+        default: ""
+      keep_releases:
+        description: How many git sha release directories to retain.
+        type: string
+        required: false
+        default: "5"
+      test_rollback:
+        description: Fail after a successful deploy so the previous release is restored.
+        type: boolean
+        required: false
+        default: false
+    secrets:
+      SITEHOST_SSH_PRIVATE_KEY:
+        description: Actions login key for the container SSH user.
+        required: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: sitehost-serverpod-${{ github.repository }}-${{ inputs.environment }}
+  cancel-in-progress: false
+
+jobs:
+  guard:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Validate inputs
+        env:
+          ENVIRONMENT: ${{ inputs.environment }}
+          SERVER_PATH: ${{ inputs.server_path }}
+          DART_VERSION: ${{ inputs.dart_version }}
+          WEB_PATH: ${{ inputs.web_path }}
+          KEEP_RELEASES: ${{ inputs.keep_releases }}
+        run: |
+          set -euo pipefail
+          if [[ ! "$ENVIRONMENT" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]{0,62}$ ]]; then
+            echo "environment must match [A-Za-z0-9][A-Za-z0-9_.-]{0,62}." >&2
+            exit 1
+          fi
+          if [[ ! "$DART_VERSION" =~ ^[0-9]+(\.[0-9]+){1,2}$ ]]; then
+            echo "dart_version must be a Dart version such as 3.12.2." >&2
+            exit 1
+          fi
+          if [[ ! "$KEEP_RELEASES" =~ ^[0-9]+$ || "$KEEP_RELEASES" -lt 1 ]]; then
+            echo "keep_releases must be a positive whole number." >&2
+            exit 1
+          fi
+          case "$SERVER_PATH" in
+            /*|*..*|*$'\n'*|*' '*)
+              echo "server_path must be a relative path without spaces or .." >&2
+              exit 1
+              ;;
+          esac
+          if [[ -n "$WEB_PATH" ]]; then
+            case "$WEB_PATH" in
+              /*) ;;
+              *)
+                echo "web_path must start with /." >&2
+                exit 1
+                ;;
+            esac
+            case "$WEB_PATH" in
+              /|*//*|*..*|*[[:space:]]*)
+                echo "web_path must be one location such as /app." >&2
+                exit 1
+                ;;
+            esac
+            if [[ ! "$WEB_PATH" =~ ^/[A-Za-z0-9._/-]+$ ]]; then
+              echo "web_path contains characters the Nginx config cannot quote." >&2
+              exit 1
+            fi
+          fi
+
+      - name: Restrict protected refs
+        if: inputs.require_main_or_tag && inputs.emergency_override != true
+        env:
+          REF: ${{ github.ref }}
+          REF_TYPE: ${{ github.ref_type }}
+        run: |
+          set -euo pipefail
+          if [[ "$REF_TYPE" != "tag" && "$REF" != "refs/heads/main" ]]; then
+            echo "This environment only deploys from main or a tag." >&2
+            echo "Re-run with emergency override to deploy this ref." >&2
+            exit 1
+          fi
+
+  deploy:
+    needs: guard
+    if: always() && needs.guard.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    environment: ${{ inputs.environment }}
+    env:
+      SITEHOST_APP_PATH: ${{ vars.SITEHOST_APP_PATH || '/container/application' }}
+      DEPLOY_ENVIRONMENT: ${{ inputs.environment }}
+      DEPLOY_SHA: ${{ github.sha }}
+      SITEHOST_SITE_URL: ${{ vars.SITEHOST_SITE_URL }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Normalize configuration
+        env:
+          SITEHOST_SSH_PORT_RAW: ${{ vars.SITEHOST_SSH_PORT }}
+          SITEHOST_SSH_HOST_RAW: ${{ vars.SITEHOST_SSH_HOST }}
+          SITEHOST_SSH_USER_RAW: ${{ vars.SITEHOST_SSH_USER }}
+          SITEHOST_SSH_HOST_FINGERPRINT_RAW: ${{ vars.SITEHOST_SSH_HOST_FINGERPRINT }}
+          SITEHOST_SSH_PRIVATE_KEY_RAW: ${{ secrets.SITEHOST_SSH_PRIVATE_KEY }}
+        run: |
+          set -euo pipefail
+          trim() {
+            printf '%s' "$1" | tr -d '\r' | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//'
+          }
+          trim_block() {
+            local value="$1"
+            value="${value//$'\r'/}"
+            value="${value#"${value%%[![:space:]]*}"}"
+            value="${value%"${value##*[![:space:]]}"}"
+            printf '%s' "$value"
+          }
+          mask_block() {
+            local value="$1"
+            local line
+            [[ -z "$value" ]] && return 0
+            while IFS= read -r line || [[ -n "$line" ]]; do
+              if ((${#line} >= 8)); then
+                echo "::add-mask::${line}"
+              fi
+            done <<< "$value"
+          }
+          write_block() {
+            local name="$1"
+            local value="$2"
+            local delim="SITEHOST_EOF_${RANDOM}${RANDOM}"
+            {
+              printf '%s<<%s\n' "$name" "$delim"
+              if [[ -n "$value" ]]; then
+                printf '%s\n' "$value"
+                printf '\n'
+              fi
+              printf '%s\n' "$delim"
+            } >> "$GITHUB_ENV"
+          }
+          port="$(trim "${SITEHOST_SSH_PORT_RAW:-}")"
+          if [[ -z "$port" ]]; then
+            port=22
+          fi
+          if [[ ! "$port" =~ ^[0-9]+$ ]]; then
+            echo "SITEHOST_SSH_PORT must be a whole number." >&2
+            exit 1
+          fi
+          app_path="$(trim "${SITEHOST_APP_PATH:-}")"
+          if [[ -z "$app_path" ]]; then
+            app_path=/container/application
+          fi
+          private_key="$(trim_block "${SITEHOST_SSH_PRIVATE_KEY_RAW:-}")"
+          mask_block "$private_key"
+          {
+            printf 'SITEHOST_SSH_PORT=%s\n' "$port"
+            printf 'SITEHOST_SSH_HOST=%s\n' "$(trim "${SITEHOST_SSH_HOST_RAW:-}")"
+            printf 'SITEHOST_SSH_USER=%s\n' "$(trim "${SITEHOST_SSH_USER_RAW:-}")"
+            printf 'SITEHOST_SSH_HOST_FINGERPRINT=%s\n' "$(trim "${SITEHOST_SSH_HOST_FINGERPRINT_RAW:-}")"
+            printf 'SITEHOST_APP_PATH=%s\n' "$app_path"
+            printf 'SITEHOST_SITE_URL=%s\n' "$(trim "${SITEHOST_SITE_URL:-}")"
+          } >> "$GITHUB_ENV"
+          if [[ -n "$private_key" ]]; then
+            write_block SITEHOST_SSH_PRIVATE_KEY "$private_key"
+          else
+            write_block SITEHOST_SSH_PRIVATE_KEY ""
+          fi
+
+      - name: Check required configuration
+        run: |
+          set -euo pipefail
+          missing=0
+          for name in \
+            SITEHOST_SSH_PRIVATE_KEY \
+            SITEHOST_SSH_HOST \
+            SITEHOST_SSH_USER \
+            SITEHOST_SSH_HOST_FINGERPRINT \
+            SITEHOST_APP_PATH \
+            SITEHOST_SITE_URL \
+            DEPLOY_SHA
+          do
+            if [[ -z "${!name:-}" ]]; then
+              echo "Missing ${name}. Set it on the ${DEPLOY_ENVIRONMENT} environment, the repository, or the organisation." >&2
+              missing=1
+            fi
+          done
+          if [[ "$missing" -ne 0 ]]; then
+            exit 1
+          fi
+
+      - name: Setup Dart
+        uses: dart-lang/setup-dart@6afc89df92d6eb3834022f73cd65adc8cdfcb92d # v1.8.1
+        with:
+          sdk: ${{ inputs.dart_version }}
+
+      - name: Build Serverpod
+        uses: ./actions/build
+        with:
+          server_path: ${{ inputs.server_path }}
+
+      - name: Install Serverpod hosting
+        uses: ./actions/ssh
+        env:
+          APPLY_MIGRATIONS: ${{ inputs.apply_migrations && 'true' || 'false' }}
+          WEB_PATH: ${{ inputs.web_path }}
+        with:
+          script: remote-install.sh
+          command_timeout: 5m
+          env_names: SITEHOST_APP_PATH APPLY_MIGRATIONS WEB_PATH
+
+      - name: Upload release
+        uses: ./actions/upload
+        with:
+          server_path: ${{ inputs.server_path }}
+
+      - name: Publish release
+        id: publish
+        uses: ./actions/ssh
+        env:
+          PUBLISH_ACTION: publish
+        with:
+          script: remote-publish.sh
+          command_timeout: 5m
+          env_names: SITEHOST_APP_PATH DEPLOY_SHA PUBLISH_ACTION
+
+      - name: Smoke check
+        id: smoke
+        run: |
+          set -euo pipefail
+          case "$SITEHOST_SITE_URL" in
+            https://*|http://*) ;;
+            *)
+              echo "SITEHOST_SITE_URL must start with http:// or https://" >&2
+              exit 1
+              ;;
+          esac
+          base="${SITEHOST_SITE_URL%/}"
+          body="$(mktemp)"
+          code=""
+          attempt=0
+          while [[ "$attempt" -lt 8 ]]; do
+            attempt=$((attempt + 1))
+            code="$(curl --silent --show-error --location --max-time 30 \
+              --output "$body" --write-out '%{http_code}' "${base}/" || true)"
+            case "$code" in
+              ""|000|502|503|504)
+                sleep 5
+                continue
+                ;;
+            esac
+            if [[ "$code" =~ ^[0-9]+$ && "$code" -ge 500 ]]; then
+              sleep 5
+              continue
+            fi
+            break
+          done
+          case "$code" in
+            ""|000|502|503|504)
+              echo "Upstream did not answer (HTTP ${code:-none})." >&2
+              exit 1
+              ;;
+          esac
+          if [[ ! "$code" =~ ^[0-9]+$ || "$code" -ge 500 ]]; then
+            echo "Site returned HTTP ${code}." >&2
+            exit 1
+          fi
+
+      - name: Fail for rollback test
+        id: test-rollback
+        if: success() && inputs.test_rollback
+        run: |
+          echo "Test rollback is on. The deploy finished, and this step fails so the previous release is restored."
+          exit 1
+
+      - name: Prune old releases
+        if: success()
+        uses: ./actions/ssh
+        env:
+          PUBLISH_ACTION: prune
+          KEEP_RELEASES: ${{ inputs.keep_releases }}
+        with:
+          script: remote-publish.sh
+          command_timeout: 5m
+          env_names: SITEHOST_APP_PATH PUBLISH_ACTION KEEP_RELEASES
+
+      - name: Restore previous release
+        if: >-
+          failure() &&
+          steps.publish.outcome == 'success' &&
+          (steps.smoke.outcome == 'failure' || steps.test-rollback.outcome == 'failure')
+        uses: ./actions/ssh
+        env:
+          PUBLISH_ACTION: rollback
+        with:
+          script: remote-publish.sh
+          command_timeout: 5m
+          env_names: SITEHOST_APP_PATH PUBLISH_ACTION

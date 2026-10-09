@@ -1,0 +1,26 @@
+name: Upload Serverpod release
+description: Rsync an assembled Serverpod release to releases/<sha> on the SiteHost container.
+author: Talaria
+branding:
+  icon: upload
+  color: blue
+inputs:
+  server_path:
+    description: Serverpod server package, relative to the caller repository.
+    required: true
+    default: server
+runs:
+  using: composite
+  steps:
+    - name: Upload
+      shell: bash
+      env:
+        SERVER_PATH: ${{ inputs.server_path }}
+      run: |
+        set -euo pipefail
+        root="${GITHUB_WORKSPACE:-$(pwd)}"
+        case "$SERVER_PATH" in
+          /*) export BUILD_DIR="${SERVER_PATH}/build/sitehost" ;;
+          *) export BUILD_DIR="${root}/${SERVER_PATH}/build/sitehost" ;;
+        esac
+        bash "$GITHUB_ACTION_PATH/upload-release.sh"

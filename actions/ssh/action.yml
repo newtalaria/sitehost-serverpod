@@ -1,0 +1,68 @@
+name: SiteHost SSH
+description: >-
+  Run a whitelisted Serverpod container script over SSH.
+  Used by the sitehost-serverpod deploy workflow.
+author: Talaria
+branding:
+  icon: server
+  color: blue
+inputs:
+  script:
+    description: Whitelisted script. remote-install.sh or remote-publish.sh.
+    required: true
+  command_timeout:
+    description: Timeout passed to the SSH action.
+    required: false
+    default: 10m
+  env_names:
+    description: >-
+      Space-separated environment variable names to export into the remote
+      script. Values are read from the calling step's environment.
+    required: false
+    default: ""
+runs:
+  using: composite
+  steps:
+    - name: Build SSH payload
+      id: payload
+      shell: bash
+      env:
+        SCRIPT_NAME: ${{ inputs.script }}
+        ENV_NAMES: ${{ inputs.env_names }}
+        PAYLOAD_PATH: ${{ runner.temp }}/sitehost-serverpod-payload.sh
+      run: |
+        set -euo pipefail
+        case "$SCRIPT_NAME" in
+          remote-install.sh|remote-publish.sh) ;;
+          *)
+            echo "Unknown remote script: ${SCRIPT_NAME}" >&2
+            exit 1
+            ;;
+        esac
+        names=()
+        # Names are split on spaces. Each name is checked before it is exported.
+        # shellcheck disable=SC2086
+        for name in $ENV_NAMES; do
+          if [[ ! "$name" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]]; then
+            echo "Refusing to export ${name}" >&2
+            exit 1
+          fi
+          names+=("$name")
+        done
+        bash "$GITHUB_ACTION_PATH/ssh-payload.sh" \
+          "$GITHUB_ACTION_PATH/$SCRIPT_NAME" \
+          "$PAYLOAD_PATH" \
+          "${names[@]}"
+        echo "payload_path=${PAYLOAD_PATH}" >> "$GITHUB_OUTPUT"
+
+    - name: Run remote script
+      if: success()
+      uses: appleboy/ssh-action@2ead5e36573f08b82fbfce1504f1a4b05a647c6f # v1.2.2
+      with:
+        host: ${{ env.SITEHOST_SSH_HOST }}
+        username: ${{ env.SITEHOST_SSH_USER }}
+        key: ${{ env.SITEHOST_SSH_PRIVATE_KEY }}
+        port: ${{ env.SITEHOST_SSH_PORT }}
+        fingerprint: ${{ env.SITEHOST_SSH_HOST_FINGERPRINT }}
+        command_timeout: ${{ inputs.command_timeout }}
+        script_path: ${{ steps.payload.outputs.payload_path }}
